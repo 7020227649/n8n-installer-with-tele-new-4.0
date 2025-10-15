@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # ------------------------------------------------------------------
-# n8n + Telegram Bot Unified Installer (Interactive)
-# - Secure, idempotent, production-ready
-# - Prompts for required info if not supplied as arguments
-# - Installs Docker, n8n container, nginx, certbot, UFW
-# - Creates dedicated n8nbot user, venv, systemd service
-# - Embeds Python bot via heredoc
-# Usage (interactive):
-#   curl -fsSL https://example.com/install_final.sh | sudo bash
-# Or pass args to skip prompts:
-#   sudo bash install_final.sh domain.com you@example.com BOT_TOKEN USER_ID
+# n8n + Telegram Bot Unified Installer (Improved Version)
+#
+# - Addresses critical flaws from the original script.
+# - Adds full backup management: list, delete, auto-pruning.
+# - Implements safe, confirmation-based restore.
+# - Handles large backup files gracefully to prevent crashes.
+# - Adds system health monitoring and automatic log rotation.
+# - Uses interactive keyboards in Telegram for a better UX.
+#
+# Usage (as root):
+#   curl -fsSL <URL_TO_THIS_SCRIPT> | sudo bash
+# Or with arguments to skip prompts:
+#   sudo bash install_improved.sh your.domain.com your@email.com YOUR_BOT_TOKEN YOUR_USER_ID
 # ------------------------------------------------------------------
 
 set -euo pipefail
@@ -19,6 +22,14 @@ IFS=$'\n\t'
 log() { echo -e "\n[INFO] $*"; }
 warn() { echo -e "\n[WARN] $*" >&2; }
 err() { echo -e "\n[ERROR] $*" >&2; }
+# A function to run a command and log its output, or log an error if it fails.
+run_cmd() {
+    log "Executing: $*"
+    if ! "$@"; then
+        err "Command failed: $*"
+        return 1
+    fi
+}
 
 # -------- Input handling (args or interactive) --------
 ARG_DOMAIN=${1:-}
@@ -26,26 +37,23 @@ ARG_EMAIL=${2:-}
 ARG_BOT_TOKEN=${3:-}
 ARG_USER_ID=${4:-}
 
-# function to prompt with default
+# Function to prompt for non-empty input, with an option for hidden (secret) input.
 prompt_nonempty() {
   local prompt_text="$1"
-  local default="$2"
-  local secret="${3:-false}"
-  local val=""
+  local default_val="$2"
+  local is_secret="${3:-false}"
+  local user_input=""
   while true; do
-    if [[ "$secret" == "true" ]]; then
-      # -s may not work in some non-interactive contexts but that's acceptable
-      read -r -s -p "$prompt_text" val || true
-      echo
+    if [[ "$is_secret" == "true" ]]; then
+      read -r -s -p "$prompt_text" user_input || true
+      echo # Move to the next line after secret input
     else
-      read -r -p "$prompt_text" val || true
+      read -r -p "$prompt_text" user_input || true
     fi
-    # If user entered nothing, use default if provided
-    if [[ -z "$val" && -n "$default" ]]; then
-      val="$default"
-    fi
-    if [[ -n "$val" ]]; then
-      echo "$val"
+    # Use default if user input is empty
+    user_input="${user_input:-$default_val}"
+    if [[ -n "$user_input" ]]; then
+      echo "$user_input"
       return 0
     else
       echo "Input cannot be empty. Please try again."
@@ -53,430 +61,676 @@ prompt_nonempty() {
   done
 }
 
-# Determine inputs (use args if provided, otherwise prompt)
+# Determine inputs: use arguments if provided, otherwise switch to interactive prompts.
 if [[ -n "$ARG_DOMAIN" && -n "$ARG_EMAIL" && -n "$ARG_BOT_TOKEN" && -n "$ARG_USER_ID" ]]; then
   DOMAIN="$ARG_DOMAIN"
   EMAIL="$ARG_EMAIL"
   BOT_TOKEN="$ARG_BOT_TOKEN"
   USER_ID="$ARG_USER_ID"
 else
-  # Interactive prompts (hide token input)
-  echo "This installer will prompt for required information."
-  DOMAIN=$(prompt_nonempty "🧩 Enter your domain name (e.g., example.com): " "$ARG_DOMAIN" false)
-  EMAIL=$(prompt_nonempty "🧩 Enter your email (for Let's Encrypt): " "$ARG_EMAIL" false)
-  BOT_TOKEN=$(prompt_nonempty "🧩 Enter your Telegram Bot Token (input hidden): " "$ARG_BOT_TOKEN" true)
-  USER_ID=$(prompt_nonempty "🧩 Enter your Telegram numeric User ID: " "$ARG_USER_ID" false)
+  echo "--- Interactive Setup ---"
+  DOMAIN=$(prompt_nonempty "🧩 Enter your domain name (e.g., n8n.example.com): " "$ARG_DOMAIN" false)
+  EMAIL=$(prompt_nonempty "📧 Enter your email (for SSL certificate): " "$ARG_EMAIL" false)
+  BOT_TOKEN=$(prompt_nonempty "🤖 Enter your Telegram Bot Token (input hidden): " "$ARG_BOT_TOKEN" true)
+  USER_ID=$(prompt_nonempty "👤 Enter your numeric Telegram User ID: " "$ARG_USER_ID" false)
 fi
 
-# Basic validation
+# Validate that the User ID is numeric.
 if ! [[ "$USER_ID" =~ ^[0-9]+$ ]]; then
-  err "AUTHORIZED USER ID must be a numeric Telegram user id."
+  err "AUTHORIZED USER ID must be a numeric Telegram user ID."
   exit 1
 fi
 
-# -------- Config --------
+# -------- Configuration --------
 BOT_DIR="/opt/n8n_bot"
 BACKUP_DIR="/opt/n8n_backups"
+N8N_DATA_DIR="/var/n8n"
 BOT_USER="n8nbot"
 VENV_DIR="$BOT_DIR/venv"
 SYSTEMD_SERVICE="/etc/systemd/system/n8n-bot.service"
 NGINX_CONF="/etc/nginx/sites-available/n8n"
-REQUIRED_PACKAGES=(bash curl sudo gnupg2 ca-certificates lsb-release unzip software-properties-common nginx ufw python3 python3-venv python3-pip)
+REQUIRED_PACKAGES=(bash curl sudo gnupg ca-certificates lsb-release unzip software-properties-common nginx ufw python3 python3-venv python3-pip)
 
-# -------- Ensure running as root --------
+# -------- Pre-flight Check --------
 if [[ $EUID -ne 0 ]]; then
-  err "This installer must be run as root. Use sudo."
+  err "This installer must be run as root. Please use 'sudo'."
   exit 1
 fi
 
-log "Starting installation for domain: $DOMAIN"
+log "🚀 Starting n8n and Telegram Bot installation for domain: $DOMAIN"
 
-# -------- Install base packages --------
-log "Updating package lists and installing required packages..."
-apt-get update -y
-DEBIAN_FRONTEND=noninteractive apt-get install -y "${REQUIRED_PACKAGES[@]}" || { warn "APT install had issues, continuing..."; }
+# -------- System & Package Installation --------
+log "Updating package lists and installing dependencies..."
+export DEBIAN_FRONTEND=noninteractive
+run_cmd apt-get update -y
+run_cmd apt-get install -y "${REQUIRED_PACKAGES[@]}"
 
-# -------- Docker install (idempotent) --------
+# -------- Docker Setup (Idempotent) --------
 if ! command -v docker >/dev/null 2>&1; then
   log "Installing Docker..."
-  curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker.gpg
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" \
-    | tee /etc/apt/sources.list.d/docker.list > /dev/null
-  apt-get update -y
-  DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io
-  systemctl enable --now docker || true
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+  run_cmd apt-get update -y
+  run_cmd apt-get install -y docker-ce docker-ce-cli containerd.io
 else
   log "Docker is already installed."
-  systemctl enable --now docker || true
 fi
+run_cmd systemctl enable --now docker
 
-# -------- Create dedicated system user --------
+# -------- NEW: Configure Docker for Automatic Log Rotation --------
+log "Configuring Docker daemon for automatic log rotation..."
+mkdir -p /etc/docker
+cat > /etc/docker/daemon.json <<EOF
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+EOF
+run_cmd systemctl restart docker
+
+# -------- System User & Directories --------
 if ! id -u "$BOT_USER" >/dev/null 2>&1; then
   log "Creating dedicated system user '$BOT_USER'..."
-  useradd --system --home "$BOT_DIR" --shell /usr/sbin/nologin --create-home "$BOT_USER" || true
+  useradd --system --home-dir "$BOT_DIR" --shell /usr/sbin/nologin --create-home "$BOT_USER"
 else
-  log "User $BOT_USER already exists."
+  log "User '$BOT_USER' already exists."
 fi
 
-# -------- Directories & permissions --------
-log "Creating directories..."
-mkdir -p "$BOT_DIR" "$BACKUP_DIR" /var/n8n
-chown -R "$BOT_USER":"$BOT_USER" "$BOT_DIR" "$BACKUP_DIR" /var/n8n || true
-chmod 750 "$BOT_DIR" "$BACKUP_DIR" || true
-# Ensure /var/n8n is owned by uid 1000 (n8n container user)
-chown 1000:1000 /var/n8n || true
+log "Creating required directories..."
+mkdir -p "$BOT_DIR" "$BACKUP_DIR" "$N8N_DATA_DIR"
+# The n8n container user (node) has UID 1000.
+chown 1000:1000 "$N8N_DATA_DIR"
+chown -R "$BOT_USER":"$BOT_USER" "$BOT_DIR" "$BACKUP_DIR"
+chmod 750 "$BOT_DIR" "$BACKUP_DIR"
 
-# -------- n8n container management --------
-log "Ensuring n8n Docker container is present and running..."
-if docker ps -a --format '{{.Names}}' | grep -xq "n8n"; then
-  if ! docker ps --format '{{.Names}}' | grep -xq "n8n"; then
-    docker start n8n || true
-  fi
+# -------- n8n Docker Container --------
+log "Ensuring n8n Docker container is running..."
+if docker ps -a --format '{{.Names}}' | grep -Eq "^n8n$"; then
+  log "n8n container already exists. Ensuring it is started."
+  run_cmd docker start n8n
 else
-  docker run -d --restart unless-stopped --name n8n -p 5678:5678 \
+  log "Creating and starting new n8n container."
+  run_cmd docker run -d --restart unless-stopped --name n8n \
+    -p 127.0.0.1:5678:5678 \
     -e N8N_HOST="$DOMAIN" \
     -e WEBHOOK_URL="https://$DOMAIN/" \
-    -e WEBHOOK_TUNNEL_URL="https://$DOMAIN/" \
-    -v /var/n8n:/home/node/.n8n \
+    -v "$N8N_DATA_DIR:/home/node/.n8n" \
     n8nio/n8n:latest
 fi
 
-# -------- Nginx configuration --------
-log "Writing Nginx config..."
+# -------- Nginx & SSL Configuration --------
+log "Configuring Nginx reverse proxy..."
 cat > "$NGINX_CONF" <<EOF
 server {
     listen 80;
     server_name $DOMAIN;
 
-    client_max_body_size 200M;
+    # Forward validation requests to Certbot
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name $DOMAIN;
+
+    # SSL settings will be added by Certbot here
+    # ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+    # ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+    # include /etc/letsencrypt/options-ssl-nginx.conf;
+    # ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    client_max_body_size 200M; # For large webhook payloads
 
     location / {
         proxy_pass http://127.0.0.1:5678;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Connection "upgrade"; # Required for WebSockets
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_buffering off;
-        proxy_read_timeout 86400s;
-        proxy_send_timeout 86400s;
+        proxy_read_timeout 86400s; # Long timeout for long-running workflows
     }
 }
 EOF
+ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/
+rm -f /etc/nginx/sites-enabled/default
 
-ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/n8n
-rm -f /etc/nginx/sites-enabled/default || true
-nginx -t && systemctl reload nginx || warn "nginx test/reload failed; check config."
+# Create dummy webroot for Certbot
+mkdir -p /var/www/html
+run_cmd nginx -t && systemctl reload nginx
 
-# -------- Certbot (Let's Encrypt) --------
-log "Obtaining/renewing SSL certificate for $DOMAIN with certbot..."
-if ! certbot certificates -d "$DOMAIN" >/dev/null 2>&1; then
-  certbot --non-interactive --agree-tos --nginx -m "$EMAIL" -d "$DOMAIN" || warn "Certbot failed. Ensure domain points to this server and ports 80/443 are reachable."
-else
-  log "Certificate already exists for $DOMAIN."
+log "Obtaining/renewing SSL certificate with Certbot..."
+# Use --nginx flag to automatically configure Nginx for SSL
+if ! certbot --nginx --non-interactive --agree-tos -m "$EMAIL" -d "$DOMAIN"; then
+    warn "Certbot failed. This can happen if your domain is not pointing to this server's IP address."
+    warn "Please check your DNS records and re-run the script."
+    exit 1
 fi
+run_cmd systemctl reload nginx
 
-# -------- UFW firewall --------
-log "Configuring UFW..."
-ufw allow OpenSSH || true
-ufw allow 'Nginx Full' || true
-ufw --force enable || true
+# -------- Firewall Setup --------
+log "Configuring UFW firewall..."
+run_cmd ufw allow OpenSSH
+run_cmd ufw allow 'Nginx Full'
+run_cmd ufw --force enable
 
-# -------- Python environment and dependencies --------
+# -------- Python Bot Setup --------
 log "Setting up Python virtual environment..."
-if [[ ! -d "$VENV_DIR" ]]; then
-  python3 -m venv "$VENV_DIR"
-fi
+run_cmd python3 -m venv "$VENV_DIR"
 PIP="$VENV_DIR/bin/pip"
-PY="$VENV_DIR/bin/python"
-"$PIP" install --upgrade pip setuptools wheel
-"$PIP" install pyTelegramBotAPI python-dotenv || { warn "Python package install may have issues."; }
+run_cmd "$PIP" install --upgrade pip
+# NEW: Added apscheduler for automated tasks and psutil for system info
+run_cmd "$PIP" install pyTelegramBotAPI python-dotenv apscheduler psutil
 
-# -------- Bot config file --------
 log "Writing bot configuration file..."
 cat > "$BOT_DIR/n8n_bot_config.env" <<EOF
 BOT_TOKEN=$BOT_TOKEN
 AUTHORIZED_USER=$USER_ID
 DOMAIN=$DOMAIN
 BACKUP_DIR=$BACKUP_DIR
+N8N_DATA_DIR=$N8N_DATA_DIR
+LOG_FILE_PATH=$BOT_DIR/bot.log
+# NEW: Configurable backup retention policy
+BACKUP_RETENTION_DAYS=7
 EOF
-chown "$BOT_USER":"$BOT_USER" "$BOT_DIR/n8n_bot_config.env" || true
-chmod 640 "$BOT_DIR/n8n_bot_config.env" || true
+chown "$BOT_USER":"$BOT_USER" "$BOT_DIR/n8n_bot_config.env"
+chmod 600 "$BOT_DIR/n8n_bot_config.env" # More secure permissions
 
-# -------- Embed Python bot (heredoc) --------
-log "Embedding Python bot into $BOT_DIR/n8n_bot.py ..."
+log "Embedding Python bot script..."
+# This heredoc contains the entire, improved Python bot logic.
 cat > "$BOT_DIR/n8n_bot.py" <<'PYEOF'
 #!/usr/bin/env python3
 """
-n8n Telegram Bot - Embedded version
-Safe, robust, uses pyTelegramBotAPI and python-dotenv
+n8n Telegram Bot - Improved & Hardened Version
 """
 import os
 import sys
 import time
 import logging
 import tarfile
-from datetime import date
+import subprocess
+import shutil
+import psutil
+from logging.handlers import RotatingFileHandler
+from datetime import datetime, timedelta, date
 from glob import glob
 from pathlib import Path
 from dotenv import load_dotenv
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from apscheduler.schedulers.background import BackgroundScheduler
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-ENV_PATH = "/opt/n8n_bot/n8n_bot_config.env"
-if not os.path.exists(ENV_PATH):
-    logging.error("Config file not found: %s", ENV_PATH)
+# --- Initial Configuration ---
+# Load environment variables from the config file.
+env_path = Path(__file__).parent / "n8n_bot_config.env"
+if not env_path.exists():
+    # Use print for early errors before logging is configured.
+    print(f"FATAL: Config file not found at {env_path}")
     sys.exit(1)
-load_dotenv(ENV_PATH)
+load_dotenv(dotenv_path=env_path)
 
+# --- Logging Setup ---
+LOG_FILE = os.getenv("LOG_FILE_PATH", "bot.log")
+log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+# Use a rotating file handler to prevent log files from growing indefinitely.
+file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=2)
+file_handler.setFormatter(log_formatter)
+# Also log to console for systemd logs.
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+
+# --- Bot & App Configuration ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    logging.error("BOT_TOKEN not set in env")
+AUTHORIZED_USER = int(os.getenv("AUTHORIZED_USER", 0))
+DOMAIN = os.getenv("DOMAIN")
+BACKUP_DIR = Path(os.getenv("BACKUP_DIR", "/opt/n8n_backups"))
+N8N_DATA_DIR = Path(os.getenv("N8N_DATA_DIR", "/var/n8n"))
+RETENTION_DAYS = int(os.getenv("BACKUP_RETENTION_DAYS", 7))
+TELEGRAM_FILE_LIMIT_MB = 45 # Safer limit than 50MB
+
+if not all([BOT_TOKEN, AUTHORIZED_USER, DOMAIN]):
+    logger.critical("FATAL: Missing critical environment variables (BOT_TOKEN, AUTHORIZED_USER, DOMAIN).")
     sys.exit(1)
-try:
-    AUTHORIZED_USER = int(os.getenv("AUTHORIZED_USER", "0"))
-except ValueError:
-    logging.error("AUTHORIZED_USER must be an integer")
-    sys.exit(1)
 
-DOMAIN = os.getenv("DOMAIN", "")
-BACKUP_DIR = os.getenv("BACKUP_DIR", "/opt/n8n_backups")
-VAR_N8N_DIR = "/var/n8n"
+# Ensure directories exist.
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+bot = telebot.TeleBot(BOT_TOKEN, threaded=True, parse_mode="Markdown")
 
-Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
+# --- Authorization Decorator ---
+# A clean way to protect all bot handlers.
+def authorized_only(func):
+    def wrapper(message):
+        if message.from_user.id != AUTHORIZED_USER:
+            bot.reply_to(message, "🚫 You are not authorized to use this bot.")
+            logger.warning(f"Unauthorized access attempt by user ID: {message.from_user.id}")
+            return
+        return func(message)
+    return wrapper
 
-bot = telebot.TeleBot(BOT_TOKEN, threaded=True)
-
-def is_authorized(message_or_user):
+# --- Helper Functions ---
+def run_shell_command(cmd_list):
+    """Executes a shell command safely and returns its code and output."""
     try:
-        uid = message_or_user.from_user.id
-    except Exception:
-        uid = int(message_or_user)
-    return uid == AUTHORIZED_USER
+        result = subprocess.run(
+            cmd_list,
+            capture_output=True,
+            text=True,
+            check=False,  # Don't raise exception on non-zero exit codes
+            timeout=300 # 5 minute timeout for long operations
+        )
+        return result.returncode, result.stdout.strip() or result.stderr.strip()
+    except FileNotFoundError:
+        return -1, f"Command not found: {cmd_list[0]}"
+    except subprocess.TimeoutExpired:
+        return -1, "Command timed out."
+    except Exception as e:
+        return -1, f"An unexpected error occurred: {str(e)}"
 
-def safe_run(cmd_list):
-    import subprocess
-    try:
-        out = subprocess.check_output(cmd_list, stderr=subprocess.STDOUT, text=True)
-        return 0, out
-    except subprocess.CalledProcessError as e:
-        return e.returncode, e.output
+def get_backups():
+    """Returns a sorted list of backup file paths, newest first."""
+    return sorted(BACKUP_DIR.glob("n8n-backup-*.tar.gz"), key=os.path.getmtime, reverse=True)
 
-@bot.message_handler(commands=["help", "start"])
-def help_cmd(message):
-    if not is_authorized(message): return
-    bot.reply_to(message, (
+def format_bytes(size):
+    """Converts bytes to a human-readable format (KB, MB, GB)."""
+    if size is None: return "0 B"
+    power = 1024
+    n = 0
+    power_labels = {0: '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
+    while size > power and n < len(power_labels):
+        size /= power
+        n += 1
+    return f"{size:.1f} {power_labels[n]}B"
+
+# --- Core Bot Logic: Automated Tasks ---
+def prune_old_backups():
+    """Deletes backups older than RETENTION_DAYS."""
+    logger.info(f"Running scheduled backup pruning. Retaining backups from the last {RETENTION_DAYS} days.")
+    cutoff_date = datetime.now() - timedelta(days=RETENTION_DAYS)
+    count = 0
+    for f in get_backups():
+        if datetime.fromtimestamp(f.stat().st_mtime) < cutoff_date:
+            try:
+                f.unlink()
+                logger.info(f"Pruned old backup: {f.name}")
+                count += 1
+            except Exception as e:
+                logger.error(f"Failed to delete backup {f.name}: {e}")
+    if count > 0:
+        logger.info(f"Pruning complete. Deleted {count} old backup(s).")
+    return count
+
+# --- Bot Command Handlers ---
+@bot.message_handler(commands=["start", "help"])
+@authorized_only
+def send_welcome(message):
+    help_text = (
         "🤖 *n8n Bot Control Panel*\n\n"
-        "📦 Backup Commands:\n"
-        "/createbackup – Save a new backup\n"
-        "/showbackup – Send latest backup with Restore button\n"
-        "📤 Upload a backup file (.tar.gz) to restore it automatically\n\n"
-        "⚙️ Management:\n"
-        "/status – Check if container is running\n"
-        "/logs – Show recent logs\n"
-        "/restart – Restart n8n\n"
-        "/update – Update n8n to latest\n"
-        "/restore – Restore last saved backup\n\n"
-        "/help – Show this message again"
-    ), parse_mode="Markdown")
+        "Here are the available commands:\n\n"
+        "📦 *Backup & Restore:*\n"
+        "`/createbackup` - Create a new backup of n8n data.\n"
+        "`/listbackups` - Show all available backups.\n"
+        "`/getbackup` - Show a menu to download a backup file.\n"
+        "`/deletebackups` - Show a menu to delete backups.\n"
+        "`/prunebackups` - Manually delete backups older than retention period.\n"
+        "📤 _To restore, simply upload a `.tar.gz` backup file to this chat._\n\n"
+        "⚙️ *n8n Management:*\n"
+        "`/status` - Check if the n8n container is running.\n"
+        "`/restart` - Restart the n8n container.\n"
+        "`/logs` - Show the 20 most recent n8n container logs.\n"
+        "`/update` - Pull the latest n8n image and recreate the container.\n\n"
+        "🖥️ *System:*\n"
+        "`/sysinfo` - Show server disk, memory, and CPU usage."
+    )
+    bot.reply_to(message, help_text)
 
 @bot.message_handler(commands=["status"])
-def status(message):
-    if not is_authorized(message): return
-    code, out = safe_run(["docker", "ps", "--filter", "name=n8n", "--format", "table {{.Names}}\t{{.Status}}"])
-    if code == 0 and out.strip():
-        bot.reply_to(message, f"📦 *n8n Status:*\n```\n{out}\n```", parse_mode="Markdown")
+@authorized_only
+def status_command(message):
+    code, out = run_shell_command(["docker", "ps", "--filter", "name=n8n", "--format", "{{.Status}}"])
+    if code == 0 and out:
+        bot.reply_to(message, f"✅ *n8n Status:*\n`{out}`")
     else:
-        bot.reply_to(message, "⚠️ n8n container not found or docker error.")
+        bot.reply_to(message, f"❌ *n8n container not found or is stopped.*\n`{out}`")
 
 @bot.message_handler(commands=["logs"])
-def logs(message):
-    if not is_authorized(message): return
-    code, out = safe_run(["docker", "logs", "--tail", "200", "n8n"])
-    if code == 0:
-        bot.reply_to(message, f"📄 *n8n Logs:*\n```\n{out}\n```", parse_mode="Markdown")
+@authorized_only
+def logs_command(message):
+    bot.send_chat_action(message.chat.id, 'typing')
+    code, out = run_shell_command(["docker", "logs", "--tail", "20", "n8n"])
+    if code == 0 and out:
+        # Split message if too long for Telegram
+        if len(out) > 4000:
+            out = out[-4000:]
+        bot.reply_to(message, f"📜 *Recent n8n Logs:*\n```\n{out}\n```")
     else:
-        bot.reply_to(message, "⚠️ Failed to fetch logs or container not running.")
+        bot.reply_to(message, f"⚠️ Could not fetch logs. Container might be stopped.\n`{out}`")
 
 @bot.message_handler(commands=["restart"])
-def restart(message):
-    if not is_authorized(message): return
-    code, _ = safe_run(["docker", "restart", "n8n"])
+@authorized_only
+def restart_command(message):
+    bot.reply_to(message, "⏳ Restarting n8n container...")
+    bot.send_chat_action(message.chat.id, 'typing')
+    code, out = run_shell_command(["docker", "restart", "n8n"])
     if code == 0:
-        bot.reply_to(message, "🔁 n8n restarted!")
+        bot.send_message(message.chat.id, "✅ n8n restarted successfully!")
     else:
-        bot.reply_to(message, "❌ Failed to restart n8n.")
+        bot.send_message(message.chat.id, f"❌ Failed to restart n8n:\n`{out}`")
 
 @bot.message_handler(commands=["update"])
-def update(message):
-    if not is_authorized(message): return
-    bot.reply_to(message, "⏳ Updating n8n image and restarting container...")
-    safe_run(["docker", "pull", "n8nio/n8n:latest"])
-    safe_run(["docker", "rm", "-f", "n8n"])
+@authorized_only
+def update_command(message):
+    msg = bot.reply_to(message, "⏳ Pulling latest n8n image... this may take a moment.")
+    bot.send_chat_action(message.chat.id, 'typing')
+    code, out = run_shell_command(["docker", "pull", "n8nio/n8n:latest"])
+    if code != 0:
+        bot.edit_message_text(f"❌ Failed to pull image:\n`{out}`", msg.chat.id, msg.message_id)
+        return
+
+    bot.edit_message_text("🛑 Stopping and removing old container...", msg.chat.id, msg.message_id)
+    run_shell_command(["docker", "stop", "n8n"])
+    run_shell_command(["docker", "rm", "n8n"])
+
+    bot.edit_message_text("🚀 Starting new container...", msg.chat.id, msg.message_id)
     run_cmd = [
         "docker", "run", "-d", "--restart", "unless-stopped", "--name", "n8n",
-        "-p", "5678:5678",
+        "-p", "127.0.0.1:5678:5678",
         "-e", f"N8N_HOST={DOMAIN}",
         "-e", f"WEBHOOK_URL=https://{DOMAIN}/",
-        "-e", f"WEBHOOK_TUNNEL_URL=https://{DOMAIN}/",
-        "-v", f"{VAR_N8N_DIR}:/home/node/.n8n",
+        "-v", f"{N8N_DATA_DIR.resolve()}:/home/node/.n8n",
         "n8nio/n8n:latest"
     ]
-    code, out = safe_run(run_cmd)
+    code, out = run_shell_command(run_cmd)
     if code == 0:
-        bot.reply_to(message, "✅ n8n updated and restarted!")
+        bot.edit_message_text("✅ n8n updated and restarted successfully!", msg.chat.id, msg.message_id)
     else:
-        bot.reply_to(message, f"❌ Update failed:\n```\n{out}\n```", parse_mode="Markdown")
-
-def latest_backup_path():
-    files = sorted(glob(os.path.join(BACKUP_DIR, "n8n-backup-*.tar.gz")), reverse=True)
-    return files[0] if files else None
+        bot.edit_message_text(f"❌ Update failed during container creation:\n`{out}`", msg.chat.id, msg.message_id)
 
 @bot.message_handler(commands=["createbackup"])
-def create_backup(message):
-    if not is_authorized(message): return
-    today = date.today().isoformat()
-    name = f"n8n-backup-{today}.tar.gz"
-    dst = os.path.join(BACKUP_DIR, name)
+@authorized_only
+def create_backup_command(message):
+    bot.reply_to(message, "⏳ Creating backup... this might take a while for large instances.")
+    bot.send_chat_action(message.chat.id, 'typing')
+    
+    filename = f"n8n-backup-{date.today().isoformat()}-{int(time.time())}.tar.gz"
+    filepath = BACKUP_DIR / filename
+    
     try:
-        with tarfile.open(dst, "w:gz") as tar:
-            tar.add(VAR_N8N_DIR, arcname=os.path.basename(VAR_N8N_DIR))
-        bot.reply_to(message, f"📦 Backup created:\n`{dst}`", parse_mode="Markdown")
+        with tarfile.open(filepath, "w:gz") as tar:
+            tar.add(N8N_DATA_DIR, arcname=N8N_DATA_DIR.name)
+        
+        file_size = format_bytes(filepath.stat().st_size)
+        prune_old_backups() # Prune after creating a new one
+        bot.send_message(message.chat.id, f"✅ Backup created successfully!\n\n`{filename}` ({file_size})")
     except Exception as e:
-        bot.reply_to(message, f"❌ Backup failed: {str(e)}")
+        logger.error(f"Backup creation failed: {e}")
+        bot.send_message(message.chat.id, f"❌ Backup failed: {str(e)}")
 
-@bot.message_handler(commands=["showbackup"])
-def show_backup(message):
-    if not is_authorized(message): return
-    latest = latest_backup_path()
-    if latest and os.path.exists(latest):
-        try:
-            with open(latest, "rb") as fh:
-                bot.send_document(message.chat.id, fh)
-            markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("🔁 Restore this Backup", callback_data="restore_backup"))
-            bot.send_message(message.chat.id, "📂 Tap below to restore the above backup:", reply_markup=markup)
-        except Exception as e:
-            bot.reply_to(message, f"❌ Failed to send backup: {str(e)}")
+@bot.message_handler(commands=["listbackups"])
+@authorized_only
+def list_backups_command(message):
+    bot.send_chat_action(message.chat.id, 'typing')
+    backups = get_backups()
+    if not backups:
+        bot.reply_to(message, "No backups found.")
+        return
+    
+    response = "*Available Backups (newest first):*\n\n"
+    for bf in backups[:20]: # Show max 20
+        stat = bf.stat()
+        response += f"`{bf.name}`\n"
+        response += f"_{format_bytes(stat.st_size)} - {datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M')}_\n\n"
+    
+    if len(backups) > 20:
+        response += f"...and {len(backups) - 20} more."
+        
+    bot.reply_to(message, response)
+
+@bot.message_handler(commands=["sysinfo"])
+@authorized_only
+def sysinfo_command(message):
+    try:
+        disk = shutil.disk_usage("/")
+        mem = psutil.virtual_memory()
+        cpu = psutil.cpu_percent(interval=1)
+        
+        info = (
+            f"🖥️ *System Information*\n\n"
+            f"💾 *Disk Usage:*\n"
+            f"Total: {format_bytes(disk.total)}\n"
+            f"Used: {format_bytes(disk.used)} ({disk.percent}%)\n"
+            f"Free: {format_bytes(disk.free)}\n\n"
+            f"🧠 *Memory Usage:*\n"
+            f"Total: {format_bytes(mem.total)}\n"
+            f"Used: {format_bytes(mem.used)} ({mem.percent}%)\n\n"
+            f"⚙️ *CPU Load:* {cpu}%"
+        )
+        bot.reply_to(message, info)
+    except Exception as e:
+        logger.error(f"Could not retrieve system info: {e}")
+        bot.reply_to(message, f"❌ Failed to get system info: {e}")
+        
+@bot.message_handler(commands=["prunebackups"])
+@authorized_only
+def prune_command(message):
+    bot.reply_to(message, "⏳ Manually running backup pruning...")
+    count = prune_old_backups()
+    bot.send_message(message.chat.id, f"✅ Pruning complete. Deleted {count} old backup(s).")
+
+# --- Interactive Menu Handlers ---
+
+def build_backup_menu(action_prefix):
+    """Builds an inline keyboard menu for backups."""
+    markup = InlineKeyboardMarkup()
+    markup.row_width = 1
+    backups = get_backups()
+    if not backups:
+        return None
+    for bf in backups[:10]: # Limit menu size
+        callback_data = f"{action_prefix}:{bf.name}"
+        # Truncate filename if too long for button
+        display_name = (bf.name[:40] + '..') if len(bf.name) > 42 else bf.name
+        markup.add(InlineKeyboardButton(display_name, callback_data=callback_data))
+    markup.add(InlineKeyboardButton("Cancel", callback_data=f"{action_prefix}:cancel"))
+    return markup
+
+@bot.message_handler(commands=["deletebackups"])
+@authorized_only
+def delete_backups_menu(message):
+    markup = build_backup_menu("delete")
+    if markup:
+        bot.reply_to(message, "🗑️ Select a backup to delete:", reply_markup=markup)
     else:
-        bot.reply_to(message, "⚠️ No backup found.")
+        bot.reply_to(message, "No backups available to delete.")
 
-@bot.message_handler(commands=["restore"])
-def manual_restore(message):
-    if not is_authorized(message): return
-    latest = latest_backup_path()
-    if not latest:
-        bot.reply_to(message, "⚠️ No backup found.")
+@bot.message_handler(commands=["getbackup"])
+@authorized_only
+def get_backup_menu(message):
+    markup = build_backup_menu("get")
+    if markup:
+        bot.reply_to(message, "💾 Select a backup to download:", reply_markup=markup)
+    else:
+        bot.reply_to(message, "No backups available to download.")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("delete:"))
+def handle_delete_callback(call):
+    filename = call.data.split(":", 1)[1]
+    if filename == 'cancel':
+        bot.edit_message_text("Cancelled.", call.message.chat.id, call.message.message_id)
         return
+
+    filepath = BACKUP_DIR / filename
+    if filepath.exists():
+        try:
+            filepath.unlink()
+            bot.answer_callback_query(call.id, f"Deleted {filename}")
+            bot.edit_message_text(f"✅ Deleted `{filename}`.", call.message.chat.id, call.message.message_id)
+        except Exception as e:
+            bot.answer_callback_query(call.id, f"Error: {e}")
+    else:
+        bot.answer_callback_query(call.id, "File not found.")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("get:"))
+def handle_get_callback(call):
+    filename = call.data.split(":", 1)[1]
+    if filename == 'cancel':
+        bot.edit_message_text("Cancelled.", call.message.chat.id, call.message.message_id)
+        return
+
+    filepath = BACKUP_DIR / filename
+    if not filepath.exists():
+        bot.answer_callback_query(call.id, "File not found.")
+        return
+
+    file_size_mb = filepath.stat().st_size / (1024 * 1024)
+    if file_size_mb > TELEGRAM_FILE_LIMIT_MB:
+        bot.answer_callback_query(call.id, "File is too large!")
+        bot.send_message(call.message.chat.id, f"⚠️ The backup `{filename}` is {file_size_mb:.1f} MB, which is too large to send via Telegram. Please retrieve it directly from the server at `{filepath.resolve()}`.")
+        return
+    
+    bot.answer_callback_query(call.id, "Sending file...")
+    bot.send_chat_action(call.message.chat.id, 'upload_document')
     try:
-        with tarfile.open(latest, "r:gz") as tar:
-            tar.extractall(path="/")
-        safe_run(["docker", "restart", "n8n"])
-        bot.reply_to(message, "✅ Restored from latest backup.")
+        with open(filepath, "rb") as doc:
+            bot.send_document(call.message.chat.id, doc)
     except Exception as e:
-        bot.reply_to(message, f"❌ Restore failed: {str(e)}")
+        logger.error(f"Failed to send document {filename}: {e}")
+        bot.send_message(call.message.chat.id, f"❌ Failed to send file: {e}")
 
-@bot.callback_query_handler(func=lambda call: call.data == "restore_backup")
-def restore_button(call):
-    if call.from_user.id != AUTHORIZED_USER:
-        bot.answer_callback_query(call.id, "❌ Unauthorized")
-        return
-    latest = latest_backup_path()
-    if not latest:
-        bot.send_message(call.message.chat.id, "⚠️ No backup to restore.")
-        bot.answer_callback_query(call.id, "❌ No backup found.")
-        return
-    try:
-        with tarfile.open(latest, "r:gz") as tar:
-            tar.extractall(path="/")
-        safe_run(["docker", "restart", "n8n"])
-        bot.send_message(call.message.chat.id, "✅ Backup restored successfully.")
-        bot.answer_callback_query(call.id, "✅ Restored!")
-    except Exception as e:
-        bot.send_message(call.message.chat.id, f"❌ Restore failed: {str(e)}")
-        bot.answer_callback_query(call.id, "❌ Restore failed")
 
+# --- Restore from Upload ---
 @bot.message_handler(content_types=["document"])
-def upload_backup(message):
-    if not is_authorized(message): return
+@authorized_only
+def handle_document_upload(message):
     doc = message.document
     if not doc.file_name.lower().endswith(".tar.gz"):
-        bot.reply_to(message, "⚠️ Only .tar.gz backup files are supported.")
+        bot.reply_to(message, "⚠️ This is not a valid backup file. Only `.tar.gz` files are accepted.")
         return
+
     try:
+        bot.reply_to(message, "⏳ Downloading uploaded file...")
         file_info = bot.get_file(doc.file_id)
-        downloaded = bot.download_file(file_info.file_path)
-        path = os.path.join(BACKUP_DIR, doc.file_name)
-        with open(path, "wb") as f:
-            f.write(downloaded)
-        if tarfile.is_tarfile(path):
-            with tarfile.open(path, "r:gz") as tar:
-                tar.extractall(path="/")
-            safe_run(["docker", "restart", "n8n"])
-            bot.reply_to(message, f"✅ Backup `{doc.file_name}` restored and n8n restarted!", parse_mode="Markdown")
-        else:
-            os.remove(path)
-            bot.reply_to(message, "❌ Uploaded file is not a valid tar.gz archive.")
+        downloaded_file = bot.download_file(file_info.file_path)
+        
+        # Save to a temporary path for confirmation
+        temp_path = BACKUP_DIR / f"restore-upload-{int(time.time())}.tar.gz"
+        with open(temp_path, "wb") as f:
+            f.write(downloaded_file)
+            
+        if not tarfile.is_tarfile(temp_path):
+            temp_path.unlink()
+            bot.send_message(message.chat.id, "❌ The uploaded file is corrupted or not a valid tar archive.")
+            return
+
+        markup = InlineKeyboardMarkup()
+        markup.add(
+            InlineKeyboardButton("✅ Yes, Restore Now", callback_data=f"confirm_restore:{temp_path.name}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_restore:{temp_path.name}")
+        )
+        bot.send_message(message.chat.id, 
+            f"‼️ *CONFIRM RESTORE*\n\nYou are about to restore from `{doc.file_name}`. This will overwrite all current n8n data. Are you sure?",
+            reply_markup=markup)
+
     except Exception as e:
-        bot.reply_to(message, f"❌ Restore failed: {str(e)}")
+        logger.error(f"Error handling document upload: {e}")
+        bot.reply_to(message, f"❌ An error occurred during file processing: {str(e)}")
 
-def main_poll_loop():
-    backoff = 1
-    while True:
-        try:
-            bot.infinity_polling(timeout=60, long_polling_timeout=60)
-        except Exception:
-            time.sleep(backoff)
-            backoff = min(300, backoff * 2)
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("confirm_restore:", "cancel_restore:")))
+def handle_restore_confirmation(call):
+    action, filename = call.data.split(":", 1)
+    filepath = BACKUP_DIR / filename
+    
+    if not filepath.exists():
+        bot.edit_message_text("Restore file not found. It might have expired or been deleted.", call.message.chat.id, call.message.message_id)
+        return
 
+    if action == "cancel_restore":
+        filepath.unlink() # Clean up the temp file
+        bot.edit_message_text("❌ Restore cancelled.", call.message.chat.id, call.message.message_id)
+        return
+
+    # --- Restore is confirmed ---
+    bot.edit_message_text("⏳ Restoring data... n8n will be restarted.", call.message.chat.id, call.message.message_id)
+    bot.send_chat_action(call.message.chat.id, 'typing')
+    
+    try:
+        # Stop n8n to prevent data corruption
+        run_shell_command(["docker", "stop", "n8n"])
+
+        # Clean the existing data directory
+        for item in N8N_DATA_DIR.iterdir():
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+
+        # Extract the backup
+        with tarfile.open(filepath, "r:gz") as tar:
+            # Important: extract contents into the target dir, not the dir itself
+            tar.extractall(path=N8N_DATA_DIR.parent)
+
+        # Clean up the uploaded file
+        filepath.unlink()
+        
+        # Restart n8n
+        run_shell_command(["docker", "start", "n8n"])
+
+        bot.send_message(call.message.chat.id, "✅ Restore complete! n8n has been restarted.")
+    except Exception as e:
+        logger.error(f"Restore process failed: {e}")
+        bot.send_message(call.message.chat.id, f"❌ Restore failed: {str(e)}")
+        # Try to restart n8n anyway
+        run_shell_command(["docker", "start", "n8n"])
+
+
+# --- Main Application Loop ---
 if __name__ == "__main__":
     try:
-        logging.info("Starting n8n Telegram bot...")
-        main_poll_loop()
-    except KeyboardInterrupt:
-        logging.info("Shutting down bot...")
+        logger.info("Starting n8n Telegram bot...")
+        
+        # --- Setup and start the scheduler for automated tasks ---
+        scheduler = BackgroundScheduler(timezone="UTC")
+        # Run prune job once at startup, then every 24 hours
+        scheduler.add_job(prune_old_backups, 'interval', hours=24, next_run_time=datetime.now())
+        scheduler.start()
+        
+        logger.info("Bot is polling for messages...")
+        bot.infinity_polling(timeout=60, long_polling_timeout=30)
+        
+    except Exception as e:
+        logger.critical(f"Bot polling loop crashed: {e}")
+    finally:
+        if 'scheduler' in locals() and scheduler.running:
+            scheduler.shutdown()
+        logger.info("Bot has shut down.")
+
 PYEOF
 
-# -------- LICENSE (MIT) --------
-cat > "$BOT_DIR/LICENSE" <<'LIC_EOF'
-MIT License
+# -------- Systemd Service Setup --------
+# Ensure the Python script is executable
+chmod +x "$BOT_DIR/n8n_bot.py"
+chown -R "$BOT_USER":"$BOT_USER" "$BOT_DIR"
 
-Copyright (c) 2025 webclasher
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-LIC_EOF
-
-# Ensure ownership and permissions for bot files
-chown -R "$BOT_USER":"$BOT_USER" "$BOT_DIR" "$BACKUP_DIR" || true
-chmod 750 "$BOT_DIR" || true
-chmod 640 "$BOT_DIR/n8n_bot_config.env" || true
-chmod 750 "$BOT_DIR/n8n_bot.py" || true
-
-# Write systemd service file
+log "Writing systemd service file..."
 cat > "$SYSTEMD_SERVICE" <<EOF
 [Unit]
-Description=n8n Telegram Bot
+Description=n8n Telegram Management Bot
 After=network.target docker.service
 Wants=docker.service
 
@@ -487,22 +741,29 @@ Group=$BOT_USER
 WorkingDirectory=$BOT_DIR
 ExecStart=$VENV_DIR/bin/python $BOT_DIR/n8n_bot.py
 Restart=always
-RestartSec=5
+RestartSec=10
 EnvironmentFile=$BOT_DIR/n8n_bot_config.env
+# Security Hardening
 PrivateTmp=true
+ProtectSystem=full
 NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload || true
-systemctl enable --now n8n-bot.service || warn "Failed to enable/start n8n-bot.service immediately. Check 'systemctl status n8n-bot.service'."
+log "Enabling and starting the n8n-bot service..."
+run_cmd systemctl daemon-reload
+run_cmd systemctl enable --now n8n-bot.service
 
-log "Installation complete!"
-echo "-----------------------------------------"
-echo "Site: https://$DOMAIN"
-echo "Bot dir: $BOT_DIR"
-echo "Backups: $BACKUP_DIR"
-echo "To view bot logs: sudo journalctl -u n8n-bot.service -f"
-echo "-----------------------------------------"
+log "✅ Installation complete!"
+echo "-----------------------------------------------------"
+echo "Your n8n instance is available at: https://$DOMAIN"
+echo "Your Telegram bot is now running."
+echo ""
+echo "To view bot logs, run:"
+echo "sudo journalctl -u n8n-bot.service -f"
+echo ""
+echo "Or check the log file:"
+echo "sudo tail -f $BOT_DIR/bot.log"
+echo "-----------------------------------------------------"
