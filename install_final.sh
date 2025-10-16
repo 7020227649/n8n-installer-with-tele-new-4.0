@@ -1,81 +1,74 @@
 #!/bin/bash
-# n8n Telegram Bot Installer (Pro Version)
-#
-# Easily manage, backup, and restore your n8n workflows using a secure Telegram bot.
-# Designed for non-coders • Works on Google Cloud free-tier, Hetzner, DigitalOcean
-#
-# 🚀 One-Line Installer:
-#   curl -sSL https://raw.githubusercontent.com/7020227649/n8n-installer-with-tele-new-4.0/main/install_final.sh | sudo bash
-#
-# ⚠️ Prerequisites:
-#   1. n8n must already be running in Docker
-#   2. You must have sudo access
-#   3. (Optional) A domain pointing to your server (for SSL setup)
-#
-# ✅ Features:
-#   • /backup – Full backup (workflows + credentials)
-#   • /export-creds – Credentials only
-#   • /status, /logs, /restart, /upgrade
-#   • /list + delete backups
-#   • Auto-cleanup (keeps last 5)
-#   • Optional Nginx + Let's Encrypt SSL
-#   • Restore by sending .tar.gz
+# n8n + Telegram Bot Installer (Pro)
+# For FRESH VPS – installs Docker, n8n, and Telegram bot in one go
+# GitHub: https://github.com/7020227649/n8n-installer-with-tele-new-4.0
 
 set -euo pipefail
 
-# === CONFIG ===
-BACKUP_DIR="/root/n8n-backups"
-SCRIPT_DIR="/root"
-BOT_PY="$SCRIPT_DIR/telegram_bot.py"
-BACKUP_SH="$SCRIPT_DIR/backup_n8n.sh"
-AUTO_BACKUP_CRON="/etc/cron.d/n8n-auto-backup"
-SERVICE="n8n-telegram-bot"
-
-# === COLORS ===
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 log() { echo -e "${GREEN}[+]${NC} $1"; }
 warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 error() { echo -e "${RED}[✗]${NC} $1" >&2; exit 1; }
 
-# === 1. PREREQUISITES CHECK ===
-log "🔍 Checking prerequisites..."
-command -v docker >/dev/null || error "Docker not found. Please install n8n via Docker first."
-N8N_CONTAINER=$(docker ps --filter "ancestor=n8nio/n8n" --format "{{.Names}}" | head -n1)
-[[ -n "$N8N_CONTAINER" ]] || error "n8n container not running. Start it before installing the bot."
-N8N_PORT=$(docker port "$N8N_CONTAINER" 5678/tcp 2>/dev/null | cut -d: -f2 | head -n1 || echo "5678")
-
-# === 2. TELEGRAM SETUP ===
-read -rp "$(echo -e ${YELLOW}"[?] Enter your Telegram Bot Token (from @BotFather): "${NC})" BOT_TOKEN
-[[ -n "$BOT_TOKEN" ]] || error "Bot token is required."
-
-read -rp "$(echo -e ${YELLOW}"[?] Enter your Telegram Chat ID (from @userinfobot): "${NC})" CHAT_ID
-[[ "$CHAT_ID" =~ ^-?[0-9]+$ ]] || error "Chat ID must be a number."
-
-# === 3. INSTALL DEPENDENCIES ===
-log "📦 Installing dependencies..."
-export DEBIAN_FRONTEND=noninteractive
+# === 1. SYSTEM UPDATE ===
+log "🔄 Updating system..."
 apt-get update -qq
+apt-get install -y curl wget gnupg lsb-release apt-transport-https ca-certificates
+
+# === 2. INSTALL DOCKER ===
+if ! command -v docker &> /dev/null; then
+  log "🐳 Installing Docker..."
+  curl -fsSL https://get.docker.com | sh
+  usermod -aG docker root
+fi
+
+# === 3. TELEGRAM & DOMAIN INPUT ===
+read -rp "$(echo -e ${YELLOW}"[?] Telegram Bot Token (from @BotFather): "${NC})" BOT_TOKEN
+[[ -n "$BOT_TOKEN" ]] || error "Bot token required."
+
+read -rp "$(echo -e ${YELLOW}"[?] Your Telegram Chat ID (from @userinfobot): "${NC})" CHAT_ID
+[[ "$CHAT_ID" =~ ^-?[0-9]+$ ]] || error "Chat ID must be numeric."
+
+read -rp "$(echo -e ${YELLOW}"[?] Domain for SSL (leave blank to skip): "${NC})" DOMAIN
+
+# === 4. LAUNCH n8n CONTAINER ===
+log "🚀 Starting n8n..."
+mkdir -p /root/n8n-data
+docker run -d \
+  --name n8n \
+  -p 5678:5678 \
+  -v /root/n8n-data:/home/node/.n8n \
+  -e N8N_BASIC_AUTH_ACTIVE=true \
+  -e N8N_BASIC_AUTH_USER=admin \
+  -e N8N_BASIC_AUTH_PASSWORD=secure_password \
+  --restart unless-stopped \
+  n8nio/n8n
+
+N8N_CONTAINER="n8n"
+N8N_PORT="5678"
+
+# === 5. INSTALL BOT DEPENDENCIES ===
+log "📦 Installing Python & Telegram bot..."
 apt-get install -y python3 python3-pip gzip nginx certbot python3-certbot-nginx cron >/dev/null
 pip3 install -q python-telegram-bot==20.7
 
-# === 4. CREATE BACKUP SCRIPT (WORKFLOWS + CREDENTIALS) ===
-log "💾 Creating backup script..."
-cat > "$BACKUP_SH" << EOF
+# === 6. BACKUP SCRIPT (WORKFLOWS + CREDENTIALS) ===
+cat > /root/backup_n8n.sh << 'EOF'
 #!/bin/bash
 set -e
+BACKUP_DIR="/root/n8n-backups"
 mkdir -p "$BACKUP_DIR"
-TS=\$(date +"%Y%m%d_%H%M%S")
-cd "\$BACKUP_DIR"
-docker exec "$N8N_CONTAINER" n8n export:workflow --all --output="workflows_\$TS.json" --pretty
-docker exec "$N8N_CONTAINER" n8n export:credentials --all --output="credentials_\$TS.json" --pretty
-tar -czf "n8n_full_\$TS.tar.gz" "workflows_\$TS.json" "credentials_\$TS.json"
-rm -f "workflows_\$TS.json" "credentials_\$TS.json"
+TS=$(date +"%Y%m%d_%H%M%S")
+cd "$BACKUP_DIR"
+docker exec n8n n8n export:workflow --all --output="workflows_$TS.json" --pretty
+docker exec n8n n8n export:credentials --all --output="credentials_$TS.json" --pretty
+tar -czf "n8n_full_$TS.tar.gz" "workflows_$TS.json" "credentials_$TS.json"
+rm -f "workflows_$TS.json" "credentials_$TS.json"
 EOF
-chmod +x "$BACKUP_SH"
+chmod +x /root/backup_n8n.sh
 
-# === 5. EMBED FULL TELEGRAM BOT ===
-log "🤖 Embedding Telegram bot with all commands..."
-cat > "$BOT_PY" << 'EOF'
+# === 7. TELEGRAM BOT (FULL) ===
+cat > /root/telegram_bot.py << 'EOF'
 import os, logging, subprocess
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
@@ -84,7 +77,6 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 AUTHORIZED_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
 BACKUP_DIR = "/root/n8n-backups"
-N8N_CONTAINER = os.getenv("N8N_CONTAINER")
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
 def is_auth(u): return u.effective_chat.id == AUTHORIZED_CHAT_ID
@@ -101,20 +93,20 @@ async def start(u, c):
         "👋 **n8n Telegram Bot (Pro)**\\n\\n"
         "🔐 Secure • 💾 Full Backup • 🧹 Auto-cleaned\\n\\n"
         "**Commands:**\\n"
-        "• /backup – Full backup (workflows + creds)\\n"
+        "• /backup – Full backup\\n"
         "• /export-creds – Credentials only\\n"
         "• /list – Manage backups\\n"
         "• /status – System health\\n"
         "• /logs – n8n logs\\n"
         "• /restart – Restart n8n\\n"
         "• /upgrade – Update n8n\\n"
-        "• /auto-backup on/off – Daily auto-backup\\n\\n"
+        "• /auto-backup on/off – Daily backup\\n\\n"
         "📤 Send a .tar.gz to restore!"
     )
 
 async def backup_cmd(u, c):
     if not is_auth(u): return await unauth(u)
-    await u.message.reply_text("⏳ Creating full backup...")
+    await u.message.reply_text("⏳ Creating backup...")
     try:
         subprocess.run(["/root/backup_n8n.sh"], check=True)
         files = [f for f in os.listdir(BACKUP_DIR) if f.endswith('.tar.gz')]
@@ -126,7 +118,7 @@ async def backup_cmd(u, c):
         else:
             with open(fp, 'rb') as f: await u.message.reply_document(f, filename=latest)
         cleanup()
-        await u.message.reply_text("✅ Full backup completed!")
+        await u.message.reply_text("✅ Backup completed!")
     except Exception as e:
         logging.exception("Backup error")
         await u.message.reply_text("💥 Backup failed.")
@@ -138,8 +130,8 @@ async def export_creds(u, c):
         ts = subprocess.run(["date", "+%Y%m%d_%H%M%S"], capture_output=True, text=True).stdout.strip()
         cred_file = f"credentials_only_{ts}.json"
         fp = os.path.join(BACKUP_DIR, cred_file)
-        subprocess.run(["docker", "exec", N8N_CONTAINER, "n8n", "export:credentials", "--all", f"--output=/tmp/{cred_file}"], check=True)
-        subprocess.run(["docker", "cp", f"{N8N_CONTAINER}:/tmp/{cred_file}", fp], check=True)
+        subprocess.run(["docker", "exec", "n8n", "n8n", "export:credentials", "--all", f"--output=/tmp/{cred_file}"], check=True)
+        subprocess.run(["docker", "cp", f"n8n:/tmp/{cred_file}", fp], check=True)
         with open(fp, 'rb') as f: await u.message.reply_document(f, filename=cred_file)
         os.remove(fp)
         await u.message.reply_text("✅ Credentials exported!")
@@ -158,7 +150,7 @@ async def list_cmd(u, c):
 async def status_cmd(u, c):
     if not is_auth(u): return await unauth(u)
     try:
-        ver = subprocess.run(["docker", "exec", N8N_CONTAINER, "n8n", "--version"], capture_output=True, text=True).stdout.strip()
+        ver = subprocess.run(["docker", "exec", "n8n", "n8n", "--version"], capture_output=True, text=True).stdout.strip()
         disk = subprocess.run(["df", "-h", "/"], capture_output=True, text=True).stdout.split('\n')[1]
         used, total = disk.split()[2], disk.split()[1]
         ram = subprocess.run(["free", "-m"], capture_output=True, text=True).stdout.split('\n')[1]
@@ -177,7 +169,7 @@ async def status_cmd(u, c):
 async def logs_cmd(u, c):
     if not is_auth(u): return await unauth(u)
     try:
-        logs = subprocess.run(["docker", "logs", "--tail", "20", N8N_CONTAINER], capture_output=True, text=True).stdout
+        logs = subprocess.run(["docker", "logs", "--tail", "20", "n8n"], capture_output=True, text=True).stdout
         if len(logs) > 4000: logs = logs[-4000:]
         await u.message.reply_text(f"```\n{logs}\n```", parse_mode='MarkdownV2')
     except Exception as e:
@@ -186,7 +178,7 @@ async def logs_cmd(u, c):
 async def restart_cmd(u, c):
     if not is_auth(u): return await unauth(u)
     k = [[InlineKeyboardButton("✅ Restart n8n", callback_data="confirm_restart")]]
-    await u.message.reply_text("⚠️ Restart n8n container?", reply_markup=InlineKeyboardMarkup(k))
+    await u.message.reply_text("⚠️ Restart n8n?", reply_markup=InlineKeyboardMarkup(k))
 
 async def upgrade_cmd(u, c):
     if not is_auth(u): return await unauth(u)
@@ -199,9 +191,9 @@ async def auto_backup_cmd(u, c):
     cron_file = "/etc/cron.d/n8n-auto-backup"
     if arg == "on":
         with open(cron_file, "w") as f:
-            f.write("0 2 * * * root /root/backup_n8n.sh > /dev/null 2>&1\\n")
+            f.write("0 2 * * * root /root/backup_n8n.sh > /dev/null 2>&1\n")
         subprocess.run(["systemctl", "reload", "cron"])
-        await u.message.reply_text("✅ Auto-backup enabled (daily at 2 AM).")
+        await u.message.reply_text("✅ Auto-backup enabled.")
     elif arg == "off":
         if os.path.exists(cron_file):
             os.remove(cron_file)
@@ -223,10 +215,10 @@ async def handle_doc(u, c):
         subprocess.run(["tar", "-xzf", gz, "-C", "/tmp"], check=True)
         wf = [f for f in os.listdir("/tmp") if f.startswith("workflows_")][0]
         cred = [f for f in os.listdir("/tmp") if f.startswith("credentials_")][0]
-        subprocess.run(["docker", "cp", f"/tmp/{wf}", f"{N8N_CONTAINER}:/tmp/wf.json"], check=True)
-        subprocess.run(["docker", "exec", N8N_CONTAINER, "n8n", "import:workflow", "--input=/tmp/wf.json", "--userId=1"], check=True)
-        subprocess.run(["docker", "cp", f"/tmp/{cred}", f"{N8N_CONTAINER}:/tmp/cred.json"], check=True)
-        subprocess.run(["docker", "exec", N8N_CONTAINER, "n8n", "import:credentials", "--input=/tmp/cred.json"], check=True)
+        subprocess.run(["docker", "cp", f"/tmp/{wf}", "n8n:/tmp/wf.json"], check=True)
+        subprocess.run(["docker", "exec", "n8n", "n8n", "import:workflow", "--input=/tmp/wf.json", "--userId=1"], check=True)
+        subprocess.run(["docker", "cp", f"/tmp/{cred}", "n8n:/tmp/cred.json"], check=True)
+        subprocess.run(["docker", "exec", "n8n", "n8n", "import:credentials", "--input=/tmp/cred.json"], check=True)
         for f in [gz, f"/tmp/{wf}", f"/tmp/{cred}"]: os.remove(f)
         await u.message.reply_text("✅ Full restore completed!")
     except Exception as e:
@@ -238,13 +230,14 @@ async def cb_handler(u, c):
     await q.answer()
     data = q.data
     if data == "confirm_restart":
-        subprocess.run(["docker", "restart", N8N_CONTAINER])
+        subprocess.run(["docker", "restart", "n8n"])
         await q.edit_message_text("✅ n8n restarted.")
     elif data == "confirm_upgrade":
         subprocess.run(["docker", "pull", "n8nio/n8n"])
-        subprocess.run(["docker", "stop", N8N_CONTAINER])
-        subprocess.run(["docker", "rm", N8N_CONTAINER])
-        await q.edit_message_text("⚠️ Upgraded. Restart n8n manually if needed.")
+        subprocess.run(["docker", "stop", "n8n"])
+        subprocess.run(["docker", "rm", "n8n"])
+        subprocess.run(["docker", "run", "-d", "--name", "n8n", "-p", "5678:5678", "-v", "/root/n8n-data:/home/node/.n8n", "-e", "N8N_BASIC_AUTH_ACTIVE=true", "-e", "N8N_BASIC_AUTH_USER=admin", "-e", "N8N_BASIC_AUTH_PASSWORD=secure_password", "--restart", "unless-stopped", "n8nio/n8n"])
+        await q.edit_message_text("✅ n8n upgraded and restarted.")
     elif data.startswith("del:"):
         f = data.split(":",1)[1]
         fp = os.path.join(BACKUP_DIR, f)
@@ -269,22 +262,20 @@ def main():
 if __name__ == "__main__": main()
 EOF
 
-# === 6. SYSTEMD SERVICE ===
-log "⚙️ Setting up systemd service..."
-cat > "/etc/systemd/system/$SERVICE.service" << EOF
+# === 8. SYSTEMD SERVICE ===
+cat > /etc/systemd/system/n8n-telegram-bot.service << EOF
 [Unit]
-Description=n8n Telegram Backup Bot (Pro)
+Description=n8n Telegram Bot (Pro)
 After=network.target docker.service
 Requires=docker.service
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=$SCRIPT_DIR
+WorkingDirectory=/root
 Environment=TELEGRAM_BOT_TOKEN=$BOT_TOKEN
 Environment=TELEGRAM_CHAT_ID=$CHAT_ID
-Environment=N8N_CONTAINER=$N8N_CONTAINER
-ExecStart=/usr/bin/python3 $BOT_PY
+ExecStart=/usr/bin/python3 /root/telegram_bot.py
 Restart=always
 RestartSec=10
 
@@ -293,20 +284,17 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now "$SERVICE"
+systemctl enable --now n8n-telegram-bot
 
-# === 7. NGINX + SSL (OPTIONAL) ===
-read -rp "$(echo -e ${YELLOW}"[?] Setup Nginx + Free SSL (Let's Encrypt)? (y/n): "${NC})" -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-  read -rp "$(echo -e ${YELLOW}"[?] Enter your domain (e.g., n8n.example.com): "${NC})" DOMAIN
-  [[ -n "$DOMAIN" ]] || error "Domain is required for SSL."
+# === 9. NGINX + SSL (IF DOMAIN PROVIDED) ===
+if [[ -n "$DOMAIN" ]]; then
+  log "🔒 Setting up Nginx + SSL for $DOMAIN..."
   cat > /etc/nginx/sites-available/n8n << EOF
 server {
     listen 80;
     server_name $DOMAIN;
     location / {
-        proxy_pass http://127.0.0.1:$N8N_PORT;
+        proxy_pass http://127.0.0.1:5678;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -321,12 +309,16 @@ EOF
   rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
   systemctl reload nginx
   certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email >/dev/null
-  log "🔒 SSL enabled! Access at: https://$DOMAIN"
+  WEB_URL="https://$DOMAIN"
 else
-  warn "Skipping SSL. n8n is accessible at http://<your-IP>:$N8N_PORT (insecure!)"
+  WEB_URL="http://$(curl -s ifconfig.me):5678"
+  warn "No domain provided. Access n8n at: $WEB_URL"
 fi
 
-# === DONE ===
+# === 10. DONE ===
 log "✅ Installation complete!"
-echo -e "${GREEN}Send /start to your Telegram bot to begin.${NC}"
-echo "View logs: ${YELLOW}journalctl -u $SERVICE -f${NC}"
+echo -e "${GREEN}n8n is running!${NC}"
+echo -e "🌐 Web UI: ${YELLOW}$WEB_URL${NC}"
+echo -e "🤖 Telegram: Send /start to your bot"
+echo -e "🔑 Default login: admin / secure_password (change it!)"
+echo -e "📜 Logs: journalctl -u n8n-telegram-bot -f"
